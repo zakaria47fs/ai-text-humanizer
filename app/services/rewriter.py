@@ -1,112 +1,50 @@
-import os
+import numpy as np
+import nltk
 
-import openai
-from langsmith import traceable
-from langsmith.wrappers import wrap_openai
+from app.services.layer1_paraphrase import layer1_paraphrase
+from app.services.layer2_algorithmic import layer2_transform
+from app.services.layer3_polish import layer3_polish
 
-from app.prompts.system_prompt import SYSTEM_PROMPT
-from app.prompts.refine_prompt import REFINE_PROMPT
-
-_client = None
-
-
-def _get_client() -> openai.OpenAI:
-    global _client
-    if _client is None:
-        _client = wrap_openai(openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY")))
-    return _client
+nltk.download("punkt", quiet=True)
+nltk.download("punkt_tab", quiet=True)
 
 
-@traceable(name="pass1-rewrite", tags=["humanizer"])
-def _pass1(client, system_prompt: str, user_message: str) -> str:
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        temperature=0.85,
-        top_p=0.9,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
-    )
-    return response.choices[0].message.content
+def measure_burstiness(text: str) -> float | None:
+    """Standard deviation of per-sentence word counts."""
+    sentences = nltk.sent_tokenize(text)
+    if len(sentences) < 2:
+        return None
+    lengths = [len(s.split()) for s in sentences]
+    return float(np.std(lengths))
 
 
-@traceable(name="pass2-refine", tags=["humanizer"])
-def _pass2(client, refine_prompt: str, user_message: str) -> str:
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        temperature=0.7,
-        messages=[
-            {"role": "system", "content": refine_prompt},
-            {"role": "user", "content": user_message},
-        ]
-    )
-    return response.choices[0].message.content
+async def rewrite_text(
+    text: str,
+    skip_paraphrase: bool = False,
+    skip_algorithmic: bool = False,
+    skip_polish: bool = False,
+) -> dict:
+    """Three-layer humanization pipeline."""
+    layers = []
+    burst_before = measure_burstiness(text)
 
+    if not skip_paraphrase:
+        text = await layer1_paraphrase(text)
+        layers.append("t5_paraphrase")
 
-@traceable(name="rewrite-pipeline", tags=["humanizer"])
-def rewrite_text(
-    original_text: str,
-    analysis: dict,
-    style_references: list[str]
-) -> str:
-    """Main two-pass rewriting pipeline."""
+    if not skip_algorithmic:
+        text = layer2_transform(text)
+        layers.append("algorithmic_nlp")
 
-    client = _get_client()
+    if not skip_polish:
+        text = await layer3_polish(text)
+        layers.append("llm_polish")
 
-    # Format style references for the prompt
-    if style_references:
-        style_block = "\n\n---\n\n".join(
-            [f"STYLE REFERENCE {i+1}:\n{ref}" for i, ref in enumerate(style_references)]
-        )
-    else:
-        style_block = "No style references available."
+    burst_after = measure_burstiness(text)
 
-    # Format analysis findings
-    issues = []
-    if analysis["ai_word_count"] > 0:
-        issues.append(f"AI vocabulary detected: {', '.join(analysis['found_ai_words'])}")
-    if analysis["burstiness_is_low"]:
-        issues.append(f"Low sentence variety (burstiness: {analysis['burstiness']})")
-    if analysis["em_dash_count"] > 2:
-        issues.append(f"Too many em dashes ({analysis['em_dash_count']})")
-    if analysis["repeated_transitions"]:
-        issues.append(f"Repetitive transitions: {analysis['repeated_transitions']}")
-
-    issues_block = "\n".join(f"- {issue}" for issue in issues) if issues else "No major issues detected."
-
-    max_words = int(analysis["original_word_count"] * 1.35)
-
-    pass1_text = _pass1(
-        client,
-        system_prompt=SYSTEM_PROMPT,
-        user_message=f"""Rewrite the following AI-generated text to sound naturally human-written.
-
-DETECTED AI PATTERNS TO FIX:
-{issues_block}
-
-HUMAN WRITING STYLE REFERENCES (mimic this natural style):
-{style_block}
-
-ORIGINAL TEXT TO HUMANIZE:
-{original_text}
-
-CRITICAL RULES:
-- Output must NOT be more than 35% longer than the original
-- Original word count: {analysis['original_word_count']} words
-- Maximum output: {max_words} words
-- Preserve the original meaning completely
-- Write at a natural reading level suitable for students
-- Do NOT add any meta-commentary about the rewriting process"""
-    )
-
-    return _pass2(
-        client,
-        refine_prompt=REFINE_PROMPT,
-        user_message=f"""Review and lightly refine this text. Fix any remaining AI-like patterns while keeping the natural human voice. Do NOT make it longer.
-
-Maximum word count: {max_words} words
-
-TEXT TO REFINE:
-{pass1_text}"""
-    )
+    return {
+        "text": text,
+        "layers": layers,
+        "burst_before": burst_before,
+        "burst_after": burst_after,
+    }

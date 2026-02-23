@@ -1,21 +1,28 @@
+import logging
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.services.analyzer import analyze_text
-from app.services.rag import get_style_references
 from app.services.rewriter import rewrite_text
 from app.services.postprocess import postprocess
-from app.config import settings
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class HumanizeRequest(BaseModel):
     text: str
+    skip_paraphrase: bool = False
+    skip_algorithmic: bool = False
+    skip_polish: bool = False
 
 
 class HumanizeResponse(BaseModel):
-    humanized_text: str
+    original: str
+    humanized: str
+    layers_applied: list[str]
+    burstiness_before: float | None
+    burstiness_after: float | None
     original_word_count: int
     humanized_word_count: int
     length_ratio: float
@@ -28,27 +35,40 @@ async def humanize(request: HumanizeRequest):
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Input text cannot be empty.")
 
-    # Step 1: Analyze input
-    analysis = analyze_text(request.text)
+    word_count = len(request.text.split())
+    logger.info("Request received | words=%d | skip_paraphrase=%s skip_algorithmic=%s skip_polish=%s",
+                word_count, request.skip_paraphrase, request.skip_algorithmic, request.skip_polish)
 
-    # Step 2: Get human writing style references via RAG
-    style_refs = get_style_references(
-        request.text,
-        n_results=3,
-        db_path=settings.CHROMA_DB_PATH
-    )
+    try:
+        result = await rewrite_text(
+            request.text,
+            skip_paraphrase=request.skip_paraphrase,
+            skip_algorithmic=request.skip_algorithmic,
+            skip_polish=request.skip_polish,
+        )
+    except Exception:
+        logger.exception("Pipeline failed")
+        raise
 
-    # Step 3: Rewrite with LLM pipeline
-    humanized = rewrite_text(request.text, analysis, style_refs)
+    post = postprocess(request.text, result["text"])
 
-    # Step 4: Post-process and validate
-    result = postprocess(request.text, humanized)
+    logger.info("Request done   | layers=%s | burstiness %.2f → %.2f | words %d → %d | within_limit=%s",
+                result["layers"],
+                result["burst_before"] or 0,
+                result["burst_after"] or 0,
+                post["original_word_count"],
+                post["humanized_word_count"],
+                post["within_limit"])
 
     return HumanizeResponse(
-        humanized_text=result["text"],
-        original_word_count=result["original_word_count"],
-        humanized_word_count=result["humanized_word_count"],
-        length_ratio=result["length_ratio"],
-        within_limit=result["within_limit"],
-        warning=result["warning"]
+        original=request.text,
+        humanized=post["text"],
+        layers_applied=result["layers"],
+        burstiness_before=result["burst_before"],
+        burstiness_after=result["burst_after"],
+        original_word_count=post["original_word_count"],
+        humanized_word_count=post["humanized_word_count"],
+        length_ratio=post["length_ratio"],
+        within_limit=post["within_limit"],
+        warning=post["warning"],
     )
