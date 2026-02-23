@@ -1,6 +1,8 @@
 import os
 
 import openai
+from langsmith import traceable
+from langsmith.wrappers import wrap_openai
 
 from app.prompts.system_prompt import SYSTEM_PROMPT
 from app.prompts.refine_prompt import REFINE_PROMPT
@@ -11,10 +13,38 @@ _client = None
 def _get_client() -> openai.OpenAI:
     global _client
     if _client is None:
-        _client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        _client = wrap_openai(openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY")))
     return _client
 
 
+@traceable(name="pass1-rewrite", tags=["humanizer"])
+def _pass1(client, system_prompt: str, user_message: str) -> str:
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.85,
+        top_p=0.9,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+    )
+    return response.choices[0].message.content
+
+
+@traceable(name="pass2-refine", tags=["humanizer"])
+def _pass2(client, refine_prompt: str, user_message: str) -> str:
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.7,
+        messages=[
+            {"role": "system", "content": refine_prompt},
+            {"role": "user", "content": user_message},
+        ]
+    )
+    return response.choices[0].message.content
+
+
+@traceable(name="rewrite-pipeline", tags=["humanizer"])
 def rewrite_text(
     original_text: str,
     analysis: dict,
@@ -47,14 +77,10 @@ def rewrite_text(
 
     max_words = int(analysis["original_word_count"] * 1.35)
 
-    # --- PASS 1: Main rewrite ---
-    pass1_response = client.chat.completions.create(
-        model="gpt-4o",
-        temperature=0.85,
-        top_p=0.9,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"""Rewrite the following AI-generated text to sound naturally human-written.
+    pass1_text = _pass1(
+        client,
+        system_prompt=SYSTEM_PROMPT,
+        user_message=f"""Rewrite the following AI-generated text to sound naturally human-written.
 
 DETECTED AI PATTERNS TO FIX:
 {issues_block}
@@ -71,25 +97,16 @@ CRITICAL RULES:
 - Maximum output: {max_words} words
 - Preserve the original meaning completely
 - Write at a natural reading level suitable for students
-- Do NOT add any meta-commentary about the rewriting process"""}
-        ]
+- Do NOT add any meta-commentary about the rewriting process"""
     )
 
-    pass1_text = pass1_response.choices[0].message.content
-
-    # --- PASS 2: Refinement ---
-    pass2_response = client.chat.completions.create(
-        model="gpt-4o",
-        temperature=0.7,
-        messages=[
-            {"role": "system", "content": REFINE_PROMPT},
-            {"role": "user", "content": f"""Review and lightly refine this text. Fix any remaining AI-like patterns while keeping the natural human voice. Do NOT make it longer.
+    return _pass2(
+        client,
+        refine_prompt=REFINE_PROMPT,
+        user_message=f"""Review and lightly refine this text. Fix any remaining AI-like patterns while keeping the natural human voice. Do NOT make it longer.
 
 Maximum word count: {max_words} words
 
 TEXT TO REFINE:
-{pass1_text}"""}
-        ]
+{pass1_text}"""
     )
-
-    return pass2_response.choices[0].message.content
