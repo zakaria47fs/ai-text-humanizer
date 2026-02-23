@@ -136,6 +136,8 @@ celerybeat.pid
 
 # Project-specific
 chroma_db/
+app/corpus/samples/*.txt
+app/corpus/AI_Human.csv
 
 # Environments
 .env
@@ -208,3 +210,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Data
+app/corpus/AI_Human.csv
